@@ -1,0 +1,10 @@
+__pycache__
+.venv
+export
+data/*.dbf
+data/*.geojson
+data/*.shp
+data/*.shx
+data/*.cpg
+data/*.prj
+data/*.qmd
