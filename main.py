@@ -32,9 +32,7 @@ HH_CACHE    = os.path.join(OUTPUT_DIR, f"{input_name}_graph_hh.json")
 
 # ── 1. build / reuse graph ────────────────────────────────────────────────────
 if not os.path.exists(GRAPH_FILE):
-    print("=" * 60)
     print("Building graph from road network...")
-    print("=" * 60)
     from create_graph import create_graph
     create_graph(INPUT_FILE, OUTPUT_DIR, epsg=EPSG, tolerance=TOLERANCE)
 else:
@@ -42,9 +40,7 @@ else:
 
 # ── helper ────────────────────────────────────────────────────────────────────
 def _run(label, fn, *args, **kwargs):
-    print("\n" + "=" * 60)
     print(f"  {label}")
-    print("=" * 60)
     t0 = time.perf_counter()
     result = fn(*args, **kwargs)
     elapsed = time.perf_counter() - t0
