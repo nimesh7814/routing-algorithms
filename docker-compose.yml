@@ -1,0 +1,23 @@
+version: "3.9"
+
+services:
+  pathfinder:
+    build: .
+    container_name: pathfinder
+    ports:
+      - "8000:8000"
+    volumes:
+      # Mount your GeoJSON and persist the built graph + HH cache
+      - ./data:/app/data:ro          # read-only input
+      - ./export:/app/export         # read-write: graph.json, _hh.json cached here
+    environment:
+      - GRAPH_FILE=/app/export/graph.json
+      - GEOJSON_FILE=/app/data/roads.geojson
+      - EPSG=32644                   # change for your region
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/api/info"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s             # allow time for graph build on first run

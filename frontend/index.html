@@ -1,0 +1,128 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Pathfinder</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600&display=swap" rel="stylesheet">
+  <link href="https://api.mapbox.com/mapbox-gl-js/v3.3.0/mapbox-gl.css" rel="stylesheet">
+  <script src="https://api.mapbox.com/mapbox-gl-js/v3.3.0/mapbox-gl.js"></script>
+  <!-- MapLibre GL (no token needed) -->
+  <link href="https://unpkg.com/maplibre-gl@4.5.0/dist/maplibre-gl.css" rel="stylesheet" />
+  <script src="https://unpkg.com/maplibre-gl@4.5.0/dist/maplibre-gl.js"></script>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <!-- sidebar -->
+  <aside id="sidebar">
+    <div id="sidebar-header">
+      <div id="logo">
+        <svg width="22" height="22" viewBox="0 0 22 22" fill="none">
+          <circle cx="11" cy="11" r="10" stroke="var(--accent)" stroke-width="1.5"/>
+          <path d="M7 11 L11 7 L15 11" stroke="var(--accent)" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+          <path d="M11 7 L11 15" stroke="var(--accent)" stroke-width="1.5" stroke-linecap="round"/>
+        </svg>
+        <span>Pathfinder</span>
+      </div>
+    </div>
+
+    <!-- Algorithm picker -->
+    <section class="card" id="algo-section">
+      <label class="section-label">Algorithm</label>
+      <div id="algo-pills">
+        <button class="pill active" data-algo="dijkstra">Dijkstra</button>
+        <button class="pill" data-algo="bidirectional">Bidir. Dijkstra</button>
+        <button class="pill" data-algo="astar">A*</button>
+        <button class="pill" data-algo="highway">Highway H.</button>
+      </div>
+      <p id="algo-desc" class="subtle-text"></p>
+    </section>
+
+    <!-- Coordinate inputs -->
+    <section class="card" id="coords-section">
+      <label class="section-label">Coordinates <span class="subtle-text">(WGS84)</span></label>
+      <div class="coord-group">
+        <div class="coord-pin src-pin">A</div>
+        <div class="coord-inputs">
+          <input id="src-lat" type="number" placeholder="Latitude" step="any" />
+          <input id="src-lon" type="number" placeholder="Longitude" step="any" />
+        </div>
+      </div>
+      <div class="coord-group">
+        <div class="coord-pin dst-pin">B</div>
+        <div class="coord-inputs">
+          <input id="dst-lat" type="number" placeholder="Latitude" step="any" />
+          <input id="dst-lon" type="number" placeholder="Longitude" step="any" />
+        </div>
+      </div>
+      <p class="subtle-text hint-text">Or click the map — first click sets A, second sets B.</p>
+    </section>
+
+    <!-- Action button -->
+    <button id="run-btn" disabled>
+      <span id="run-label">Find Path</span>
+      <svg id="run-spinner" width="16" height="16" viewBox="0 0 16 16" style="display:none">
+        <circle cx="8" cy="8" r="6" stroke="white" stroke-width="2" fill="none" stroke-dasharray="28" stroke-dashoffset="10">
+          <animateTransform attributeName="transform" type="rotate" from="0 8 8" to="360 8 8" dur="0.8s" repeatCount="indefinite"/>
+        </circle>
+      </svg>
+    </button>
+
+    <!-- Stats panel -->
+    <section class="card" id="stats-section" style="display:none">
+      <label class="section-label">Results</label>
+      <div class="stats-grid">
+        <div class="stat-item">
+          <span class="stat-value" id="stat-dist">—</span>
+          <span class="stat-label">Distance</span>
+        </div>
+        <div class="stat-item">
+          <span class="stat-value" id="stat-time">—</span>
+          <span class="stat-label">Time</span>
+        </div>
+        <div class="stat-item">
+          <span class="stat-value" id="stat-expanded">—</span>
+          <span class="stat-label">Nodes Explored</span>
+        </div>
+        <div class="stat-item">
+          <span class="stat-value" id="stat-path-nodes">—</span>
+          <span class="stat-label">Path Nodes</span>
+        </div>
+        <div class="stat-item">
+          <span class="stat-value" id="stat-pct">—</span>
+          <span class="stat-label">Graph Coverage</span>
+        </div>
+        <div class="stat-item">
+          <span class="stat-value" id="stat-algo">—</span>
+          <span class="stat-label">Algorithm</span>
+        </div>
+      </div>
+      <!-- animation progress -->
+      <div id="progress-wrap">
+        <div id="progress-bar-track"><div id="progress-bar-fill"></div></div>
+        <span id="progress-label" class="subtle-text">Animating…</span>
+      </div>
+    </section>
+
+    <!-- Legend -->
+    <section class="card" id="legend">
+      <label class="section-label">Legend</label>
+      <div class="legend-row"><span class="legend-dot fwd-node"></span> Forward frontier</div>
+      <div class="legend-row"><span class="legend-dot bwd-node"></span> Backward frontier</div>
+      <div class="legend-row"><span class="legend-line path-line"></span> Shortest path</div>
+    </section>
+
+    <div id="graph-meta" class="subtle-text"></div>
+  </aside>
+
+  <!-- map -->
+  <div id="map"></div>
+
+  <!-- error toast -->
+  <div id="toast" class="toast hidden"></div>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>
