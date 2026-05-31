@@ -1,9 +1,11 @@
 """
 Bidirectional Dijkstra — instrumented for animation.
 Forward steps tagged "fwd", backward steps tagged "bwd".
+Each step includes an elapsed-millisecond timestamp.
 """
 
 import math
+import time
 from heapq import heappush, heappop
 
 
@@ -16,9 +18,16 @@ def build_reverse_graph(graph: dict) -> dict:
 
 
 def bidirectional_dijkstra_instrumented(graph: dict, rev_graph: dict,
-                                         source: int, target: int):
+                                         source: int, target: int,
+                                         started_at: float | None = None):
     if source == target:
         return [source], 0.0, [], 0
+
+    if started_at is None:
+        started_at = time.perf_counter()
+
+    def timestamp_ms() -> float:
+        return (time.perf_counter() - started_at) * 1000
 
     INF = float("inf")
     dist_fwd = {source: 0.0}
@@ -43,7 +52,7 @@ def bidirectional_dijkstra_instrumented(graph: dict, rev_graph: dict,
             return
         settled_fwd.add(u)
         nodes_expanded += 1
-        steps.append({"type": "node", "id": u, "direction": "fwd"})
+        steps.append({"type": "node", "id": u, "direction": "fwd", "timestamp_ms": round(timestamp_ms(), 3)})
 
         for v, w in graph.get(u, {}).items():
             nd = d + w
@@ -51,7 +60,7 @@ def bidirectional_dijkstra_instrumented(graph: dict, rev_graph: dict,
                 dist_fwd[v] = nd
                 prev_fwd[v] = u
                 heappush(pq_fwd, (nd, v))
-                steps.append({"type": "edge", "from": u, "to": v, "direction": "fwd"})
+                steps.append({"type": "edge", "from": u, "to": v, "direction": "fwd", "timestamp_ms": round(timestamp_ms(), 3)})
             if v in dist_bwd:
                 c = nd + dist_bwd[v]
                 if c < best:
@@ -70,7 +79,7 @@ def bidirectional_dijkstra_instrumented(graph: dict, rev_graph: dict,
             return
         settled_bwd.add(u)
         nodes_expanded += 1
-        steps.append({"type": "node", "id": u, "direction": "bwd"})
+        steps.append({"type": "node", "id": u, "direction": "bwd", "timestamp_ms": round(timestamp_ms(), 3)})
 
         for v, w in rev_graph.get(u, {}).items():
             nd = d + w
@@ -78,7 +87,7 @@ def bidirectional_dijkstra_instrumented(graph: dict, rev_graph: dict,
                 dist_bwd[v] = nd
                 prev_bwd[v] = u
                 heappush(pq_bwd, (nd, v))
-                steps.append({"type": "edge", "from": u, "to": v, "direction": "bwd"})
+                steps.append({"type": "edge", "from": u, "to": v, "direction": "bwd", "timestamp_ms": round(timestamp_ms(), 3)})
             if v in dist_fwd:
                 c = nd + dist_fwd[v]
                 if c < best:

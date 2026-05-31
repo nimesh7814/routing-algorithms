@@ -1,13 +1,2 @@
-__pycache__
-.venv
-export
-data/*.dbf
-data/*.geojson
-data/*.shp
-data/*.shx
-data/*.cpg
-data/*.prj
-data/*.qmd
-!data/lka_roads.dbf
-!data/lka_roads.geojson
-!data/lka_roads.shp
+backend/data/*.geojson
+!backend/data/lka_roads.geojson
