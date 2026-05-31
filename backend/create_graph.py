@@ -42,9 +42,15 @@ Find your zone: https://spatialreference.org/
 """
 
 import argparse
+import json
 import logging
 import os
 import sys
+import time
+from collections import defaultdict
+from math import hypot
+
+from pyproj import Transformer
 
 # ── Allow running from project root without installing the package ─────────────
 sys.path.insert(0, os.path.dirname(__file__))
@@ -60,6 +66,148 @@ BANNER = """
 ╔══════════════════════════════════════╗
 ║       Pathfinder — Graph Builder     ║
 ╚══════════════════════════════════════╝"""
+
+
+def _iter_line_segments(geojson: dict):
+    for feature in geojson.get("features", []):
+        geometry = feature.get("geometry") or {}
+        properties = feature.get("properties") or {}
+        geometry_type = geometry.get("type")
+
+        if geometry_type == "LineString":
+            yield geometry.get("coordinates", []), properties
+        elif geometry_type == "MultiLineString":
+            for line in geometry.get("coordinates", []):
+                yield line, properties
+
+
+def _count_line_segments(geojson: dict) -> int:
+    count = 0
+    for feature in geojson.get("features", []):
+        geometry = feature.get("geometry") or {}
+        geometry_type = geometry.get("type")
+        if geometry_type == "LineString":
+            count += 1
+        elif geometry_type == "MultiLineString":
+            count += len(geometry.get("coordinates", []))
+    return count
+
+
+def _is_oneway(properties: dict) -> bool:
+    value = properties.get("oneway")
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return False
+    return str(value).strip().lower() in {"yes", "true", "1", "forward"}
+
+
+def _render_progress(current: int, total: int) -> None:
+    if total <= 0:
+        return
+
+    width = 30
+    ratio = current / total
+    filled = int(width * ratio)
+    bar = "=" * filled + "-" * (width - filled)
+    sys.stdout.write(f"\r[{bar}] {current}/{total} ({ratio * 100:5.1f}%)")
+    sys.stdout.flush()
+
+
+def build_graph(geojson_path: str, output_path: str, epsg: int = 32644, tolerance: float = 1.0, show_progress: bool = True):
+    started_at = time.perf_counter()
+    transformer = Transformer.from_crs("EPSG:4326", f"EPSG:{epsg}", always_xy=True)
+
+    with open(geojson_path, "r", encoding="utf-8") as file:
+        geojson = json.load(file)
+
+    total_segments = _count_line_segments(geojson)
+
+    node_lookup: dict[tuple[int, int], int] = {}
+    node_coords: dict[int, tuple[float, float]] = {}
+    graph: dict[int, dict[int, float]] = defaultdict(dict)
+    next_node_id = 0
+    edge_count = 0
+
+    def get_node_id(lon: float, lat: float) -> int:
+        nonlocal next_node_id
+        x, y = transformer.transform(lon, lat)
+        if tolerance > 0:
+            key = (round(x / tolerance), round(y / tolerance))
+        else:
+            key = (round(x, 6), round(y, 6))
+
+        node_id = node_lookup.get(key)
+        if node_id is None:
+            node_id = next_node_id
+            next_node_id += 1
+            node_lookup[key] = node_id
+            node_coords[node_id] = (x, y)
+        return node_id
+
+    for index, (segment, properties) in enumerate(_iter_line_segments(geojson), start=1):
+        if len(segment) < 2:
+            if show_progress:
+                _render_progress(index, total_segments)
+            continue
+
+        forward_only = _is_oneway(properties)
+        reverse_only = str(properties.get("oneway", "")).strip() == "-1"
+
+        segment_nodes = []
+        for lon, lat in segment:
+            segment_nodes.append(get_node_id(float(lon), float(lat)))
+
+        for left_node, right_node in zip(segment_nodes, segment_nodes[1:]):
+            if left_node == right_node:
+                continue
+
+            left_x, left_y = node_coords[left_node]
+            right_x, right_y = node_coords[right_node]
+            weight = hypot(right_x - left_x, right_y - left_y)
+
+            if not reverse_only:
+                current = graph[left_node].get(right_node)
+                if current is None or weight < current:
+                    graph[left_node][right_node] = weight
+                    edge_count += 1
+
+            if not forward_only:
+                current = graph[right_node].get(left_node)
+                if current is None or weight < current:
+                    graph[right_node][left_node] = weight
+                    edge_count += 1
+
+        if show_progress:
+            _render_progress(index, total_segments)
+
+    if show_progress and total_segments > 0:
+        sys.stdout.write("\n")
+        sys.stdout.flush()
+
+    nodes = [
+        {"node_id": node_id, "x": coords[0], "y": coords[1]}
+        for node_id, coords in sorted(node_coords.items())
+    ]
+    graph_payload = {
+        "nodes": nodes,
+        "graph": {str(node_id): {str(neighbour): weight for neighbour, weight in neighbours.items()} for node_id, neighbours in graph.items()},
+    }
+
+    os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+    with open(output_path, "w", encoding="utf-8") as file:
+        json.dump(graph_payload, file)
+
+    elapsed_s = time.perf_counter() - started_at
+    if show_progress:
+        logger.info("Built %s nodes and %s directed edges.", len(nodes), edge_count)
+
+    return {
+        "n_nodes": len(nodes),
+        "n_edges": edge_count,
+        "elapsed_s": elapsed_s,
+        "output_path": output_path,
+    }
 
 
 def parse_args():
@@ -113,9 +261,6 @@ def main():
         )
         _print_summary(output_file)
         return
-
-    # ── Build ─────────────────────────────────────────────────────────────────
-    from app.core.builder import build_graph
 
     logger.info("Building graph…")
     result = build_graph(

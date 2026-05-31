@@ -1,2 +1,8 @@
 backend/data/*.geojson
 !backend/data/lka_roads.geojson
+export/*
+backend/export/*
+!backend/export/graph.json
+backend/export/highway_cache.json
+backend/**/__pycache__/
+backend/**/*.pyc
