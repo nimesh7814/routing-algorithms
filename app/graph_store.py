@@ -8,7 +8,6 @@ import math
 import os
 import time
 import logging
-from pyproj import Transformer
 
 logger = logging.getLogger(__name__)
 
@@ -56,7 +55,8 @@ def init():
     # ── Build graph if missing ──────────────────────────────────────────────
     if not os.path.exists(graph_file):
         logger.info("Graph file not found — building from GeoJSON...")
-        _build_graph(geojson, graph_file, export_dir, epsg)
+        from app.core.builder import build_graph
+        build_graph(geojson, graph_file, epsg=epsg, show_progress=False)
 
     # ── Load graph ──────────────────────────────────────────────────────────
     logger.info(f"Loading graph from {graph_file}...")
@@ -134,51 +134,4 @@ def snap(lat: float, lon: float) -> int:
     return find_nearest_node(x, y)
 
 
-# ── internal graph builder ────────────────────────────────────────────────────
 
-def _build_graph(geojson_path: str, output_path: str, output_dir: str, epsg: int):
-    import geopandas as gpd
-    import pandas as pd
-    from shapely.geometry import Point
-
-    os.makedirs(output_dir, exist_ok=True)
-    logger.info(f"Reading GeoJSON: {geojson_path}")
-    gdf = gpd.read_file(geojson_path)
-    logger.info(f"  {len(gdf)} road segments — reprojecting to EPSG:{epsg}...")
-    gdf = gdf.to_crs(epsg=epsg)
-
-    _nodes: dict = {}
-    edges = []
-
-    def get_or_create(point, tolerance=1.0):
-        for nid, coords in _nodes.items():
-            if abs(coords[0] - point.x) < tolerance and abs(coords[1] - point.y) < tolerance:
-                return nid
-        new_id = len(_nodes)
-        _nodes[new_id] = (point.x, point.y)
-        return new_id
-
-    logger.info("Extracting nodes & edges...")
-    for _, row in gdf.iterrows():
-        geom = row.geometry
-        if geom is None:
-            continue
-        lines = geom.geoms if geom.geom_type == "MultiLineString" else [geom]
-        for line in lines:
-            s = Point(line.coords[0])
-            e = Point(line.coords[-1])
-            dist = line.length
-            sid = get_or_create(s)
-            eid = get_or_create(e)
-            edges.append((sid, eid, round(dist, 2)))
-
-    nodes_list = [{"node_id": nid, "x": x, "y": y} for nid, (x, y) in _nodes.items()]
-    graph_dict: dict = {}
-    for u, v, d in edges:
-        graph_dict.setdefault(u, {})[v] = d
-        graph_dict.setdefault(v, {})[u] = d
-
-    with open(output_path, "w") as f:
-        json.dump({"graph": {str(k): v for k, v in graph_dict.items()}, "nodes": nodes_list}, f)
-
-    logger.info(f"Graph saved to {output_path} — {len(_nodes)} nodes, {len(edges)} edges")

@@ -7,17 +7,46 @@ services:
     ports:
       - "8000:8000"
     volumes:
-      # Mount your GeoJSON and persist the built graph + HH cache
-      - ./data:/app/data:ro          # read-only input
-      - ./export:/app/export         # read-write: graph.json, _hh.json cached here
+      # ── Input (read-only) ──────────────────────────────────────────────────
+      # Place ONE of the following in ./data/:
+      #   • roads.geojson       (GeoJSON LineString / MultiLineString features)
+      #   • roads.shp + sidecar files (.dbf, .shx, .prj …)
+      #
+      # The container auto-detects which format is present.
+      # To use a specific file, set GEOJSON_FILE or SHP_FILE below.
+      - ./data:/app/data:ro
+
+      # ── Output (read-write) ────────────────────────────────────────────────
+      # graph.json and *_hh.json are persisted here so rebuilds are skipped
+      # on subsequent docker compose up calls.
+      # Delete graph.json (and *_hh.json) to force a rebuild on next start.
+      - ./export:/app/export
+
     environment:
+      # Path inside the container where graph.json is stored/loaded
       - GRAPH_FILE=/app/export/graph.json
+
+      # ── GeoJSON input (default) ────────────────────────────────────────────
       - GEOJSON_FILE=/app/data/roads.geojson
-      - EPSG=32644                   # change for your region
+
+      # ── Shapefile input (uncomment + set filename to use instead) ──────────
+      # - SHP_FILE=/app/data/roads.shp
+
+      # ── Projection: set the UTM zone for your region ───────────────────────
+      # Find yours at https://spatialreference.org/
+      - EPSG=32644        # UTM 44N — Sri Lanka / South Asia  (default)
+      # - EPSG=32632      # UTM 32N — Central Europe (Germany, Italy …)
+      # - EPSG=32630      # UTM 30N — UK / Ireland
+      # - EPSG=32618      # UTM 18N — Eastern USA
+      # - EPSG=32754      # UTM 54S — Eastern Australia / Japan
+
     restart: unless-stopped
+
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/api/info"]
       interval: 30s
       timeout: 10s
       retries: 3
-      start_period: 60s             # allow time for graph build on first run
+      # Give the graph builder enough time to finish on first run
+      # before the health-check starts counting failures.
+      start_period: 120s
