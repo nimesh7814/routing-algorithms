@@ -8,3 +8,6 @@ data/*.shx
 data/*.cpg
 data/*.prj
 data/*.qmd
+!data/lka_roads.dbf
+!data/lka_roads.geojson
+!data/lka_roads.shp
