@@ -1,16 +1,3 @@
-"""
-Highway Hierarchies query.
-
-The query uses three phases:
-1. exact local search around the source,
-2. exact local search around the target on the reverse graph,
-3. shortest-path search on the reduced highway graph that skips local nodes.
-
-If the hierarchy cannot connect the two sides, it falls back to bidirectional
-Dijkstra so the API still returns an optimal shortest path for nonnegative
-weights.
-"""
-
 import math
 import os
 import pickle
@@ -44,13 +31,17 @@ def _local_dijkstra_neighbourhood(graph, source, neighbourhood_size):
     return radius, used
 
 
-def _run_limited_dijkstra(graph, source, max_distance, direction, started_at):
+def _run_limited_dijkstra(graph, source, max_distance, direction, started_at, trace_steps: bool = False):
     dist = {source: 0.0}
     prev = {source: None}
     pq = [(0.0, source)]
     settled: set[int] = set()
-    steps = []
+    steps = [] if trace_steps else None
     nodes_expanded = 0
+
+    def record_step(step: dict) -> None:
+        if steps is not None:
+            steps.append(step)
 
     while pq:
         current_dist, u = heappop(pq)
@@ -61,7 +52,8 @@ def _run_limited_dijkstra(graph, source, max_distance, direction, started_at):
 
         settled.add(u)
         nodes_expanded += 1
-        steps.append({"type": "node", "id": u, "direction": direction, "timestamp_ms": round((time.perf_counter() - started_at) * 1000, 3)})
+        if steps is not None:
+            record_step({"type": "node", "id": u, "direction": direction, "timestamp_ms": round((time.perf_counter() - started_at) * 1000, 3)})
 
         for v, w in graph.get(u, {}).items():
             if v in settled:
@@ -71,18 +63,23 @@ def _run_limited_dijkstra(graph, source, max_distance, direction, started_at):
                 dist[v] = tentative
                 prev[v] = u
                 heappush(pq, (tentative, v))
-                steps.append({"type": "edge", "from": u, "to": v, "direction": direction, "timestamp_ms": round((time.perf_counter() - started_at) * 1000, 3)})
+                if steps is not None:
+                    record_step({"type": "edge", "from": u, "to": v, "direction": direction, "timestamp_ms": round((time.perf_counter() - started_at) * 1000, 3)})
 
-    return dist, prev, steps, nodes_expanded, settled
+    return dist, prev, steps or [], nodes_expanded, settled
 
 
-def _run_multisource_dijkstra(graph, seeds, direction, started_at):
+def _run_multisource_dijkstra(graph, seeds, direction, started_at, trace_steps: bool = False):
     dist = dict(seeds)
     prev = {node: None for node in seeds}
     pq = [(d, node) for node, d in seeds.items()]
     settled: set[int] = set()
-    steps = []
+    steps = [] if trace_steps else None
     nodes_expanded = 0
+
+    def record_step(step: dict) -> None:
+        if steps is not None:
+            steps.append(step)
 
     while pq:
         current_dist, u = heappop(pq)
@@ -91,7 +88,8 @@ def _run_multisource_dijkstra(graph, seeds, direction, started_at):
 
         settled.add(u)
         nodes_expanded += 1
-        steps.append({"type": "node", "id": u, "direction": direction, "timestamp_ms": round((time.perf_counter() - started_at) * 1000, 3)})
+        if steps is not None:
+            record_step({"type": "node", "id": u, "direction": direction, "timestamp_ms": round((time.perf_counter() - started_at) * 1000, 3)})
 
         for v, w in graph.get(u, {}).items():
             if v in settled:
@@ -101,9 +99,10 @@ def _run_multisource_dijkstra(graph, seeds, direction, started_at):
                 dist[v] = tentative
                 prev[v] = u
                 heappush(pq, (tentative, v))
-                steps.append({"type": "edge", "from": u, "to": v, "direction": direction, "timestamp_ms": round((time.perf_counter() - started_at) * 1000, 3)})
+                if steps is not None:
+                    record_step({"type": "edge", "from": u, "to": v, "direction": direction, "timestamp_ms": round((time.perf_counter() - started_at) * 1000, 3)})
 
-    return dist, prev, steps, nodes_expanded
+    return dist, prev, steps or [], nodes_expanded
 
 
 def _boundary_seeds(local_dist, highway_graph):
@@ -135,8 +134,6 @@ def _combine_path(source_prev, highway_prev, target_prev, meeting_node):
 
     right = []
     target_anchor = highway_prev.get(meeting_node)
-    # The caller passes a backward predecessor map into target_prev, so the
-    # meeting node can be extended by following predecessor links toward target.
     node = target_prev.get(meeting_node)
     while node is not None:
         right.append(node)
@@ -209,8 +206,8 @@ def _build_rev_graph(graph):
 
 
 def hh_query_instrumented(graph, highway_graph, rev_graph, rev_highway_graph,
-                           neighbourhood_r, source, target, started_at: float | None = None):
-    """Return a shortest path using highway nodes where possible."""
+                           neighbourhood_r, source, target, started_at: float | None = None,
+                           trace_steps: bool = False):  # disabled by default — enable only when caller needs animation steps
     if source == target:
         return [source], 0.0, [], 0
 
@@ -221,10 +218,10 @@ def hh_query_instrumented(graph, highway_graph, rev_graph, rev_highway_graph,
     r_tgt = neighbourhood_r.get(target, 0.0)
 
     source_local_dist, source_local_prev, source_steps, source_expanded, source_settled = _run_limited_dijkstra(
-        graph, source, r_src, "fwd", started_at
+        graph, source, r_src, "fwd", started_at, trace_steps=trace_steps
     )
     target_local_dist, target_local_prev, target_steps, target_expanded, target_settled = _run_limited_dijkstra(
-        rev_graph, target, r_tgt, "bwd", started_at
+        rev_graph, target, r_tgt, "bwd", started_at, trace_steps=trace_steps
     )
 
     steps = source_steps + target_steps
@@ -255,13 +252,13 @@ def hh_query_instrumented(graph, highway_graph, rev_graph, rev_highway_graph,
         highway_target_seeds = {target: 0.0}
 
     if not highway_graph or not rev_highway_graph:
-        return bidirectional_dijkstra_instrumented(graph, rev_graph, source, target)
+        return bidirectional_dijkstra_instrumented(graph, rev_graph, source, target, started_at=started_at, trace_steps=trace_steps)
 
     fwd_dist, fwd_prev, fwd_steps, fwd_expanded = _run_multisource_dijkstra(
-        highway_graph, highway_seeds, "fwd", started_at
+        highway_graph, highway_seeds, "fwd", started_at, trace_steps=trace_steps
     )
     bwd_dist, bwd_prev, bwd_steps, bwd_expanded = _run_multisource_dijkstra(
-        rev_highway_graph, highway_target_seeds, "bwd", started_at
+        rev_highway_graph, highway_target_seeds, "bwd", started_at, trace_steps=trace_steps
     )
 
     steps.extend(fwd_steps)
@@ -282,7 +279,7 @@ def hh_query_instrumented(graph, highway_graph, rev_graph, rev_highway_graph,
 
         source_path = _reconstruct_path(source_local_prev, source_anchor)
         if not source_path:
-            return bidirectional_dijkstra_instrumented(graph, rev_graph, source, target)
+            return bidirectional_dijkstra_instrumented(graph, rev_graph, source, target, started_at=started_at, trace_steps=trace_steps)
 
         highway_path = _reconstruct_path(fwd_prev, meeting_node)
         if highway_path:
@@ -298,4 +295,11 @@ def hh_query_instrumented(graph, highway_graph, rev_graph, rev_highway_graph,
         total_distance = fwd_dist[meeting_node] + bwd_dist[meeting_node]
         return path, total_distance, steps, nodes_expanded
 
-    return bidirectional_dijkstra_instrumented(graph, rev_graph, source, target)
+    return bidirectional_dijkstra_instrumented(
+        graph,
+        rev_graph,
+        source,
+        target,
+        started_at=started_at,
+        trace_steps=trace_steps,
+    )

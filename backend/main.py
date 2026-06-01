@@ -1,40 +1,3 @@
-"""
-main.py — FastAPI routing service
-==================================
-
-Endpoints kept in this file:
-
-GET /
-    Returns {"status": "ok"} when the graph and highway caches are loaded.
-    Returns {"status": "building graph"} or {"status": "building highway cache"} while startup work is running.
-    Returns {"status": "no_graph"} when the graph cache is not available or cannot be loaded.
-
-GET /summary
-  Returns a JSON summary of the loaded graph.
-
-POST /route
-  Accepts WGS84 GeoJSON Point objects for source and destination.
-  Snaps both points to the nearest graph nodes internally.
-  Runs one selected algorithm from the available algorithm list.
-  Returns the route as WGS84 GeoJSON.
-
-Expected route request:
-  {
-    "source": {
-      "type": "Point",
-      "coordinates": [80.6350, 7.2906]
-    },
-    "destination": {
-      "type": "Point",
-      "coordinates": [80.6420, 7.2950]
-    },
-    "algorithm": "dijkstra"
-  }
-
-The source and destination coordinates must be WGS84 EPSG:4326 in
-GeoJSON order: [longitude, latitude].
-"""
-
 import json
 import math
 import os
@@ -47,7 +10,8 @@ from typing import Any
 
 import numpy as np
 from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel, Field, field_validator
+
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 from pyproj import Transformer
 from scipy.spatial import KDTree
 
@@ -64,22 +28,20 @@ from create_graph_cache import (
     ensure_binary_caches as create_graph_ensure_binary_caches,
 )
 
-# ---------------------------------------------------------------------------
-# Config
-# ---------------------------------------------------------------------------
 BASE_DIR = os.path.dirname(__file__)
 GRAPH_PATH = os.path.join(BASE_DIR, "export", "graph.json")
 HH_CACHE_PATH = os.path.join(BASE_DIR, "export", "highway_cache.json")
 GRAPH_CACHE_PATH = os.path.join(BASE_DIR, "export", "graph_cache.pkl")
 HH_CACHE_BIN_PATH = os.path.join(BASE_DIR, "export", "highway_cache.pkl")
+TRACE_DIJKSTRA_STEPS = os.environ.get("TRACE_DIJKSTRA_STEPS", "0") == "1"
+TRACE_BIDIRECTIONAL_STEPS = os.environ.get("TRACE_BIDIRECTIONAL_STEPS", "0") == "1"
+TRACE_ASTAR_STEPS = os.environ.get("TRACE_ASTAR_STEPS", "0") == "1"
+TRACE_HIGHWAY_STEPS = os.environ.get("TRACE_HIGHWAY_STEPS", "0") == "1"
 
 _TO_UTM = Transformer.from_crs("EPSG:4326", "EPSG:32644", always_xy=True)
 _TO_WGS84 = Transformer.from_crs("EPSG:32644", "EPSG:4326", always_xy=True)
 
 
-# ---------------------------------------------------------------------------
-# Graph state
-# ---------------------------------------------------------------------------
 class GraphState:
     def __init__(self) -> None:
         self.graph_loaded = False
@@ -144,12 +106,28 @@ def _load_graph_cache() -> None:
     state.nodes_wgs84 = cached["nodes_wgs84"]
     state.graph = cached["graph"]
     state.rev_graph = cached["rev_graph"]
-    state.kdtree = cached["kdtree"]
     state.kdtree_ids = cached["kdtree_ids"]
     state.bbox_min_lon = cached["bbox_min_lon"]
     state.bbox_max_lon = cached["bbox_max_lon"]
     state.bbox_min_lat = cached["bbox_min_lat"]
     state.bbox_max_lat = cached["bbox_max_lat"]
+
+    # Always rebuild KDTree from coordinates instead of trusting the pickled
+    # object — scipy's KDTree can deserialise incorrectly across versions and
+    # rebuilding is fast (microseconds vs. unpickling overhead).
+    kdtree = cached.get("kdtree")
+    if kdtree is not None:
+        try:
+            # Quick sanity-check: query a point; raises if the object is corrupt.
+            kdtree.query([0.0, 0.0])
+            state.kdtree = kdtree
+        except Exception:
+            kdtree = None
+
+    if kdtree is None:
+        pts = [state.nodes_utm[nid] for nid in state.kdtree_ids]
+        state.kdtree = KDTree(pts)
+
     state.graph_loaded = True
 
 
@@ -210,9 +188,6 @@ def _build_highway_background() -> None:
         _startup_set_stage(None)
 
 
-# ---------------------------------------------------------------------------
-# Models
-# ---------------------------------------------------------------------------
 class AlgorithmEnum(str, Enum):
     dijkstra = "dijkstra"
     astar = "astar"
@@ -256,14 +231,31 @@ class GeoJSONPoint(BaseModel):
 
 
 class RouteRequest(BaseModel):
+    model_config = ConfigDict(
+        json_schema_extra={
+            "examples": [
+                {
+                    "source": {"type": "Point", "coordinates": [79.84, 6.93]},
+                    "destination": {"type": "Point", "coordinates": [79.88, 6.96]},
+                    "algorithm": "dijkstra",
+                }
+            ]
+        }
+    )
+
     source: GeoJSONPoint
     destination: GeoJSONPoint
     algorithm: str = Field(..., description="Selected routing algorithm")
+    steps_enabled: bool = Field(
+        False,
+        description=(
+            "When true, the response includes search_steps and node_coords for "
+            "visualising the algorithm's exploration. Adds latency — leave false "
+            "for production routing."
+        ),
+    )
 
 
-# ---------------------------------------------------------------------------
-# Startup helpers
-# ---------------------------------------------------------------------------
 def available_algorithms() -> list[str]:
     algorithms = [
         AlgorithmEnum.dijkstra.value,
@@ -377,9 +369,6 @@ async def lifespan(app: FastAPI):
     yield
 
 
-# ---------------------------------------------------------------------------
-# App
-# ---------------------------------------------------------------------------
 app = FastAPI(
     title="Routing API",
     description="Routing API with only /, /summary, and /route endpoints.",
@@ -388,9 +377,16 @@ app = FastAPI(
 )
 
 
-# ---------------------------------------------------------------------------
-# Coordinate and GeoJSON helpers
-# ---------------------------------------------------------------------------
+from fastapi.middleware.cors import CORSMiddleware
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"], 
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
 def wgs84_to_utm(lon: float, lat: float) -> tuple[float, float]:
     return _TO_UTM.transform(lon, lat)
 
@@ -450,15 +446,57 @@ def _build_route_geojson(path: list[int]) -> dict[str, Any]:
     }
 
 
-def _run_algorithm(src: int, tgt: int, algorithm: str, started_at: float):
+def _build_trace_node_coords(steps: list[dict], path: list[int]) -> dict[str, list[float]]:
+    node_ids: set[int] = set(path)
+    for step in steps:
+        if step.get("type") == "node":
+            node_ids.add(int(step["id"]))
+        elif step.get("type") == "edge":
+            node_ids.add(int(step["from"]))
+            node_ids.add(int(step["to"]))
+
+    coords: dict[str, list[float]] = {}
+    for node_id in node_ids:
+        if node_id in state.nodes_wgs84:
+            lon, lat = state.nodes_wgs84[node_id]
+            coords[str(node_id)] = [lon, lat]
+    return coords
+
+
+def _run_algorithm(src: int, tgt: int, algorithm: str, started_at: float, steps_enabled: bool = False):
+    # Per-request tracing flag: the env-var TRACE_* flags set a server-wide
+    # default; the caller can override by passing steps_enabled=True.
+    trace = steps_enabled
+
     if algorithm == AlgorithmEnum.dijkstra.value:
-        return dijkstra_instrumented(state.graph, state.nodes_utm, src, tgt, started_at=started_at)
+        return dijkstra_instrumented(
+            state.graph,
+            state.nodes_utm,
+            src,
+            tgt,
+            started_at=started_at,
+            trace_steps=trace or TRACE_DIJKSTRA_STEPS,
+        )
 
     if algorithm == AlgorithmEnum.astar.value:
-        return astar_instrumented(state.graph, state.nodes_utm, src, tgt, started_at=started_at)
+        return astar_instrumented(
+            state.graph,
+            state.nodes_utm,
+            src,
+            tgt,
+            started_at=started_at,
+            trace_steps=trace or TRACE_ASTAR_STEPS,
+        )
 
     if algorithm == AlgorithmEnum.bidirectional.value:
-        return bidirectional_dijkstra_instrumented(state.graph, state.rev_graph, src, tgt, started_at=started_at)
+        return bidirectional_dijkstra_instrumented(
+            state.graph,
+            state.rev_graph,
+            src,
+            tgt,
+            started_at=started_at,
+            trace_steps=trace or TRACE_BIDIRECTIONAL_STEPS,
+        )
 
     if algorithm == AlgorithmEnum.highway.value:
         path, best_dist, steps, nodes_expanded = hh_query_instrumented(
@@ -470,6 +508,7 @@ def _run_algorithm(src: int, tgt: int, algorithm: str, started_at: float):
             source=src,
             target=tgt,
             started_at=started_at,
+            trace_steps=trace or TRACE_HIGHWAY_STEPS,
         )
 
         return path, best_dist, steps, nodes_expanded
@@ -477,9 +516,6 @@ def _run_algorithm(src: int, tgt: int, algorithm: str, started_at: float):
     raise HTTPException(status_code=400, detail="Unknown routing algorithm.")
 
 
-# ---------------------------------------------------------------------------
-# Endpoints
-# ---------------------------------------------------------------------------
 @app.get("/", summary="Check whether the graph cache is available")
 def root():
     if state.graph_loaded and state.highway_ready:
@@ -534,6 +570,45 @@ def summary():
     }
 
 
+@app.get("/bbox", summary="Return available data boundary as WGS84")
+def bbox():
+    if not state.graph_loaded:
+        return {
+            "status": "no_graph",
+            "graph_path": GRAPH_PATH,
+            "detail": state.graph_error or "graph cache is not available.",
+        }
+
+    return {
+        "status": "ok",
+        "crs": "EPSG:4326 WGS84",
+        "bbox_wgs84": {
+            "min_lon": round(state.bbox_min_lon, 7),
+            "min_lat": round(state.bbox_min_lat, 7),
+            "max_lon": round(state.bbox_max_lon, 7),
+            "max_lat": round(state.bbox_max_lat, 7),
+        },
+        "geojson": {
+            "type": "Feature",
+            "geometry": {
+                "type": "Polygon",
+                "coordinates": [
+                    [
+                        [round(state.bbox_min_lon, 7), round(state.bbox_min_lat, 7)],
+                        [round(state.bbox_max_lon, 7), round(state.bbox_min_lat, 7)],
+                        [round(state.bbox_max_lon, 7), round(state.bbox_max_lat, 7)],
+                        [round(state.bbox_min_lon, 7), round(state.bbox_max_lat, 7)],
+                        [round(state.bbox_min_lon, 7), round(state.bbox_min_lat, 7)],
+                    ]
+                ],
+            },
+            "properties": {
+                "crs": "EPSG:4326 WGS84",
+            },
+        },
+    }
+
+
 @app.post("/route", summary="Compute route from source Point to destination Point")
 def route(req: RouteRequest):
     if not state.graph_loaded:
@@ -558,7 +633,9 @@ def route(req: RouteRequest):
         )
 
     started_at = time.perf_counter()
-    path, total_distance, steps, nodes_expanded = _run_algorithm(src_id, tgt_id, req.algorithm, started_at)
+    path, total_distance, steps, nodes_expanded = _run_algorithm(
+        src_id, tgt_id, req.algorithm, started_at, steps_enabled=req.steps_enabled
+    )
     elapsed_ms = (time.perf_counter() - started_at) * 1000
 
     if path is None:
@@ -581,9 +658,12 @@ def route(req: RouteRequest):
         "destination_snap_distance_m": round(tgt_snap, 2),
         "total_distance_m": round(total_distance, 4),
         "time_ms": round(elapsed_ms, 3),
+        "total_nodes": len(state.nodes_utm),
         "nodes_expanded": nodes_expanded,
         "edges_explored": edges_explored,
-        "search_steps": steps,
+        # steps and node_coords are only populated when steps_enabled=true
+        "search_steps": steps if req.steps_enabled else [],
         "path_nodes": path,
+        "node_coords": _build_trace_node_coords(steps, path) if req.steps_enabled else {},
         "geojson": _build_route_geojson(path),
     }

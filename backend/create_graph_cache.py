@@ -1,17 +1,3 @@
-"""
-create_graph_cache.py
-═════════════════════
-Build the routing graph JSON plus the binary graph and highway caches.
-
-This script is the cache-aware variant used by the FastAPI startup flow.
-It writes:
-- export/graph.json
-- export/graph_cache.pkl
-- export/highway_cache.pkl
-
-If graph.json already exists, it can regenerate just the binary caches.
-"""
-
 import argparse
 import json
 import logging
@@ -345,7 +331,7 @@ def parse_args():
 
 
 def resolve_paths(args):
-    input_file = args.input or os.environ.get("GEOJSON_FILE", "data/lka_roads.geojson")
+    input_file = args.input or os.environ.get("GEOJSON_FILE", "data/roads.geojson")
     output_file = args.output or os.environ.get("GRAPH_FILE", "export/graph.json")
     epsg = args.epsg or int(os.environ.get("EPSG", "32644"))
     return input_file, output_file, epsg
@@ -431,13 +417,6 @@ def main():
     print(f"   Saved to : {result['output_path']}")
     print(f"   Graph cache   : {result['graph_cache_path']}")
     print(f"   Highway cache : {result['highway_cache_path']}")
-    print()
-    print("Next steps:")
-    print("  1. Run  docker compose up  (the server will load these files directly)")
-    print("  2. Or pre-build the Highway Hierarchy index:")
-    print(f"       python create_graph_cache.py --input {input_file} --output {output_file}")
-    print("     Then start the container — the binary caches are also generated.")
-
 
 if __name__ == "__main__":
     main()

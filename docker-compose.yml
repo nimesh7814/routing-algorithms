@@ -1,0 +1,29 @@
+name: navigation
+
+services:
+  backend:
+    container_name: navigation-backend
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    ports:
+      - "8000:8000"
+    environment:
+      EPSG: "32644"
+    volumes:
+      - ./backend/export:/app/export
+      - ./backend/data:/app/data:ro
+    restart: unless-stopped
+
+  frontend:
+    container_name: navigation-frontend
+    build:
+      context: .
+      dockerfile: frontend/Dockerfile
+      args:
+        VITE_API_URL: http://localhost:8000
+    ports:
+      - "3000:80"
+    depends_on:
+      - backend
+    restart: unless-stopped

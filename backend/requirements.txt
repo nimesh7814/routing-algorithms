@@ -1,16 +1,6 @@
-# Routing API — Python dependencies
-# Install with: pip install -r requirements.txt
-
-# Web framework
-fastapi==0.136.3
-uvicorn[standard]==0.48.0      # [standard] adds WebSocket + faster event loop (httptools, uvloop)
-
-# Data validation (used by FastAPI)
-pydantic==2.13.4
-
-# Coordinate reprojection  (WGS84 ↔ EPSG:32644)
-pyproj==3.7.2
-
-# Nearest-node KD-tree lookup
-scipy==1.17.1
-numpy==2.4.4
+fastapi
+uvicorn[standard]
+pydantic
+numpy
+scipy
+pyproj

@@ -1,8 +1,3 @@
-"""
-A* with Euclidean heuristic — instrumented for animation.
-Exploration events carry elapsed-millisecond timestamps for animation.
-"""
-
 import math
 import time
 from heapq import heappush, heappop
@@ -14,11 +9,14 @@ def euclidean_heuristic(node_id: int, target_id: int, nodes: dict) -> float:
     return math.hypot(x2 - x1, y2 - y1)
 
 
-def astar_instrumented(graph: dict, nodes_coords: dict, source: int, target: int, started_at: float | None = None):
-    """
-    Returns:
-        path, total_distance, steps, nodes_expanded
-    """
+def astar_instrumented(
+    graph: dict,
+    nodes_coords: dict,
+    source: int,
+    target: int,
+    started_at: float | None = None,
+    trace_steps: bool = False,  # disabled by default — enable only when caller needs animation steps
+):
     if started_at is None:
         started_at = time.perf_counter()
 
@@ -30,8 +28,12 @@ def astar_instrumented(graph: dict, nodes_coords: dict, source: int, target: int
     pq = [(h_src, source)]
     prev = {source: None}
     settled: set = set()
-    steps = []
+    steps = [] if trace_steps else None
     nodes_expanded = 0
+
+    def record_step(step: dict) -> None:
+        if steps is not None:
+            steps.append(step)
 
     while pq:
         f_u, u = heappop(pq)
@@ -39,7 +41,7 @@ def astar_instrumented(graph: dict, nodes_coords: dict, source: int, target: int
             continue
         settled.add(u)
         nodes_expanded += 1
-        steps.append({"type": "node", "id": u, "direction": "fwd", "timestamp_ms": round(timestamp_ms(), 3)})
+        record_step({"type": "node", "id": u, "direction": "fwd", "timestamp_ms": round(timestamp_ms(), 3)})
 
         if u == target:
             break
@@ -54,10 +56,10 @@ def astar_instrumented(graph: dict, nodes_coords: dict, source: int, target: int
                 prev[v] = u
                 h_v = euclidean_heuristic(v, target, nodes_coords)
                 heappush(pq, (tentative_g + h_v, v))
-                steps.append({"type": "edge", "from": u, "to": v, "direction": "fwd", "timestamp_ms": round(timestamp_ms(), 3)})
+                record_step({"type": "edge", "from": u, "to": v, "direction": "fwd", "timestamp_ms": round(timestamp_ms(), 3)})
 
     if target not in g:
-        return None, float("inf"), steps, nodes_expanded
+        return None, float("inf"), steps or [], nodes_expanded
 
     path, node = [], target
     while node is not None:
@@ -65,4 +67,4 @@ def astar_instrumented(graph: dict, nodes_coords: dict, source: int, target: int
         node = prev.get(node)
     path.reverse()
 
-    return path, g[target], steps, nodes_expanded
+    return path, g[target], steps or [], nodes_expanded
