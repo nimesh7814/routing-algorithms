@@ -5,8 +5,9 @@ main.py — FastAPI routing service
 Endpoints kept in this file:
 
 GET /
-  Returns {"status": "ok"} when export/graph.json is available and loaded.
-  Returns {"status": "no_graph"} when export/graph.json is not available or cannot be loaded.
+    Returns {"status": "ok"} when the graph and highway caches are loaded.
+    Returns {"status": "building graph"} or {"status": "building highway cache"} while startup work is running.
+    Returns {"status": "no_graph"} when the graph cache is not available or cannot be loaded.
 
 GET /summary
   Returns a JSON summary of the loaded graph.
@@ -37,7 +38,9 @@ GeoJSON order: [longitude, latitude].
 import json
 import math
 import os
+import pickle
 import time
+import threading
 from contextlib import asynccontextmanager
 from enum import Enum
 from typing import Any
@@ -49,13 +52,16 @@ from pyproj import Transformer
 from scipy.spatial import KDTree
 
 from algorithms.astar import astar_instrumented
-from algorithms.bidirectional import bidirectional_dijkstra_instrumented, build_reverse_graph
+from algorithms.bidirectional import bidirectional_dijkstra_instrumented
 from algorithms.dijkstra import dijkstra_instrumented
 from algorithms.highway import (
-    build_highway_hierarchy,
     hh_query_instrumented,
     load_hh,
-    save_hh,
+)
+from create_graph_cache import (
+    build_graph as create_graph_build_graph,
+    build_highway_cache as create_graph_build_highway_cache,
+    ensure_binary_caches as create_graph_ensure_binary_caches,
 )
 
 # ---------------------------------------------------------------------------
@@ -64,6 +70,8 @@ from algorithms.highway import (
 BASE_DIR = os.path.dirname(__file__)
 GRAPH_PATH = os.path.join(BASE_DIR, "export", "graph.json")
 HH_CACHE_PATH = os.path.join(BASE_DIR, "export", "highway_cache.json")
+GRAPH_CACHE_PATH = os.path.join(BASE_DIR, "export", "graph_cache.pkl")
+HH_CACHE_BIN_PATH = os.path.join(BASE_DIR, "export", "highway_cache.pkl")
 
 _TO_UTM = Transformer.from_crs("EPSG:4326", "EPSG:32644", always_xy=True)
 _TO_WGS84 = Transformer.from_crs("EPSG:32644", "EPSG:4326", always_xy=True)
@@ -76,6 +84,7 @@ class GraphState:
     def __init__(self) -> None:
         self.graph_loaded = False
         self.graph_error: str | None = None
+        self.startup_stage: str | None = None
 
         self.nodes_utm: dict[int, tuple[float, float]] = {}
         self.nodes_wgs84: dict[int, tuple[float, float]] = {}
@@ -100,6 +109,105 @@ class GraphState:
 
 
 state = GraphState()
+
+
+def _load_pickle(path: str) -> Any:
+    with open(path, "rb") as file:
+        return pickle.load(file)
+
+
+def _save_pickle(path: str, payload: Any) -> None:
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    with open(path, "wb") as file:
+        pickle.dump(payload, file, protocol=pickle.HIGHEST_PROTOCOL)
+
+
+def _is_fresh(cache_path: str, source_path: str) -> bool:
+    if not os.path.exists(cache_path):
+        return False
+    if not os.path.exists(source_path):
+        return True
+    return os.path.getmtime(cache_path) >= os.path.getmtime(source_path)
+
+
+def _graph_source_path() -> str:
+    return os.environ.get("GEOJSON_FILE", os.path.join(BASE_DIR, "data", "lka_roads.geojson"))
+
+
+def _startup_set_stage(stage: str | None) -> None:
+    state.startup_stage = stage
+
+
+def _load_graph_cache() -> None:
+    cached = _load_pickle(GRAPH_CACHE_PATH)
+    state.nodes_utm = cached["nodes_utm"]
+    state.nodes_wgs84 = cached["nodes_wgs84"]
+    state.graph = cached["graph"]
+    state.rev_graph = cached["rev_graph"]
+    state.kdtree = cached["kdtree"]
+    state.kdtree_ids = cached["kdtree_ids"]
+    state.bbox_min_lon = cached["bbox_min_lon"]
+    state.bbox_max_lon = cached["bbox_max_lon"]
+    state.bbox_min_lat = cached["bbox_min_lat"]
+    state.bbox_max_lat = cached["bbox_max_lat"]
+    state.graph_loaded = True
+
+
+def _load_highway_cache() -> None:
+    hw_graph, rev_hw_graph, radii = load_hh(HH_CACHE_BIN_PATH)
+    state.hw_graph = hw_graph
+    state.rev_hw_graph = rev_hw_graph
+    state.neighbourhood_r = radii
+    state.highway_ready = True
+
+
+def _build_graph_and_highway_background(source_geojson: str, epsg: int) -> None:
+    try:
+        _startup_set_stage("building graph")
+        create_graph_build_graph(
+            geojson_path=source_geojson,
+            output_path=GRAPH_PATH,
+            epsg=epsg,
+            tolerance=1.0,
+            show_progress=False,
+            stage_callback=_startup_set_stage,
+        )
+        _load_graph_cache()
+        _load_highway_cache()
+        _startup_set_stage("ok")
+        state.graph_error = None
+    except Exception as exc:
+        state.graph_error = f"Failed to build graph cache: {exc}"
+        state.graph_loaded = False
+        state.highway_ready = False
+        _startup_set_stage(None)
+
+
+def _ensure_binary_caches_background(epsg: int) -> None:
+    try:
+        create_graph_ensure_binary_caches(GRAPH_PATH, epsg=epsg, stage_callback=_startup_set_stage)
+        _load_graph_cache()
+        _load_highway_cache()
+        _startup_set_stage("ok")
+        state.graph_error = None
+    except Exception as exc:
+        state.graph_error = f"Failed to build binary caches: {exc}"
+        state.graph_loaded = False
+        state.highway_ready = False
+        _startup_set_stage(None)
+
+
+def _build_highway_background() -> None:
+    try:
+        _startup_set_stage("building highway cache")
+        create_graph_build_highway_cache(state.graph, HH_CACHE_BIN_PATH)
+        _load_highway_cache()
+        _startup_set_stage("ok")
+        state.graph_error = None
+    except Exception as exc:
+        state.graph_error = f"Failed to build highway cache: {exc}"
+        state.highway_ready = False
+        _startup_set_stage(None)
 
 
 # ---------------------------------------------------------------------------
@@ -168,61 +276,33 @@ def available_algorithms() -> list[str]:
 
 
 def _load_graph() -> None:
+    started_at = time.perf_counter()
+    print(f"[startup] Loading graph cache from {GRAPH_CACHE_PATH}...")
     state.reset()
 
-    if not os.path.exists(GRAPH_PATH):
-        state.graph_error = f"graph.json not found at {GRAPH_PATH}"
-        return
-
     try:
-        with open(GRAPH_PATH, "r", encoding="utf-8") as file:
-            raw = json.load(file)
+        if _is_fresh(GRAPH_CACHE_PATH, _graph_source_path()):
+            _load_graph_cache()
+        elif os.path.exists(GRAPH_PATH):
+            state.startup_stage = "building graph"
+            return
+        else:
+            state.startup_stage = "building graph"
+            return
 
-        raw_nodes = raw["nodes"]
-        xs: list[float] = []
-        ys: list[float] = []
-        ids: list[int] = []
-
-        for rec in raw_nodes:
-            node_id = int(rec["node_id"])
-            x = float(rec["x"])
-            y = float(rec["y"])
-
-            state.nodes_utm[node_id] = (x, y)
-            lon, lat = _TO_WGS84.transform(x, y)
-            state.nodes_wgs84[node_id] = (lon, lat)
-
-            xs.append(x)
-            ys.append(y)
-            ids.append(node_id)
-
-        state.kdtree = KDTree(np.column_stack([xs, ys]))
-        state.kdtree_ids = ids
-
-        all_lons = [coord[0] for coord in state.nodes_wgs84.values()]
-        all_lats = [coord[1] for coord in state.nodes_wgs84.values()]
-        state.bbox_min_lon = min(all_lons)
-        state.bbox_max_lon = max(all_lons)
-        state.bbox_min_lat = min(all_lats)
-        state.bbox_max_lat = max(all_lats)
-
-        raw_graph = raw["graph"]
-        for u_str, neighbours in raw_graph.items():
-            u = int(u_str)
-            state.graph[u] = {int(v_str): float(weight) for v_str, weight in neighbours.items()}
-
-        state.rev_graph = build_reverse_graph(state.graph)
         state.graph_loaded = True
         state.graph_error = None
 
+        elapsed_s = time.perf_counter() - started_at
         print(
             f"[graph] Loaded {len(state.nodes_utm):,} nodes and "
-            f"{sum(len(v) for v in state.graph.values()):,} directed edges."
+            f"{sum(len(v) for v in state.graph.values()):,} directed edges "
+            f"in {elapsed_s:.1f}s."
         )
 
     except Exception as exc:
         state.reset()
-        state.graph_error = f"Failed to load graph.json: {exc}"
+        state.graph_error = f"Failed to load graph cache: {exc}"
         print(f"[graph] {state.graph_error}")
 
 
@@ -230,26 +310,39 @@ def _build_or_load_highway() -> None:
     if not state.graph_loaded:
         return
 
-    if os.path.exists(HH_CACHE_PATH):
+    started_at = time.perf_counter()
+    print("[startup] Preparing highway hierarchy cache...")
+
+    graph_source_path = GRAPH_CACHE_PATH if os.path.exists(GRAPH_CACHE_PATH) else _graph_source_path()
+
+    if _is_fresh(HH_CACHE_BIN_PATH, graph_source_path):
+        try:
+            _load_highway_cache()
+            state.highway_ready = True
+            elapsed_s = time.perf_counter() - started_at
+            print(f"[highway] Loaded cached highway hierarchy from binary cache in {elapsed_s:.1f}s.")
+            return
+        except Exception as exc:
+            print(f"[highway] Cache load failed: {exc}. Rebuilding.")
+
+    if _is_fresh(HH_CACHE_PATH, graph_source_path):
         try:
             hw_graph, rev_hw_graph, radii = load_hh(HH_CACHE_PATH)
             state.hw_graph = hw_graph
             state.rev_hw_graph = rev_hw_graph
             state.neighbourhood_r = radii
             state.highway_ready = True
-            print("[highway] Loaded cached highway hierarchy.")
+            create_graph_build_highway_cache(state.graph, HH_CACHE_BIN_PATH)
+            elapsed_s = time.perf_counter() - started_at
+            print(f"[highway] Loaded cached highway hierarchy from legacy JSON in {elapsed_s:.1f}s.")
             return
         except Exception as exc:
-            print(f"[highway] Cache load failed: {exc}. Rebuilding.")
+            print(f"[highway] Legacy cache load failed: {exc}. Rebuilding.")
 
     try:
-        hw_graph, rev_hw_graph, radii = build_highway_hierarchy(state.graph)
-        state.hw_graph = hw_graph
-        state.rev_hw_graph = rev_hw_graph
-        state.neighbourhood_r = radii
-        state.highway_ready = True
-        save_hh(HH_CACHE_PATH, hw_graph, rev_hw_graph, radii)
-        print("[highway] Highway hierarchy built and cached.")
+        _build_highway_background()
+        elapsed_s = time.perf_counter() - started_at
+        print(f"[highway] Highway hierarchy built and cached in {elapsed_s:.1f}s.")
     except Exception as exc:
         state.highway_ready = False
         print(f"[highway] Failed to prepare highway hierarchy: {exc}")
@@ -257,8 +350,30 @@ def _build_or_load_highway() -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    startup_started_at = time.perf_counter()
+    print("[startup] Starting routing service...")
     _load_graph()
-    _build_or_load_highway()
+    if state.graph_loaded:
+        if _is_fresh(HH_CACHE_BIN_PATH, GRAPH_CACHE_PATH):
+            _build_or_load_highway()
+            _startup_set_stage("ok")
+        else:
+            _startup_set_stage("building highway cache")
+            thread = threading.Thread(target=_build_highway_background, daemon=True)
+            thread.start()
+    else:
+        if state.startup_stage == "building graph":
+            epsg = int(os.environ.get("EPSG", "32644"))
+            if os.path.exists(GRAPH_PATH):
+                thread = threading.Thread(target=_ensure_binary_caches_background, args=(epsg,), daemon=True)
+            else:
+                thread = threading.Thread(
+                    target=_build_graph_and_highway_background,
+                    args=(_graph_source_path(), epsg),
+                    daemon=True,
+                )
+            thread.start()
+    print(f"[startup] Routing service ready in {time.perf_counter() - startup_started_at:.1f}s.")
     yield
 
 
@@ -365,15 +480,21 @@ def _run_algorithm(src: int, tgt: int, algorithm: str, started_at: float):
 # ---------------------------------------------------------------------------
 # Endpoints
 # ---------------------------------------------------------------------------
-@app.get("/", summary="Check whether graph.json is available")
+@app.get("/", summary="Check whether the graph cache is available")
 def root():
-    if state.graph_loaded:
+    if state.graph_loaded and state.highway_ready:
         return {"status": "ok"}
+
+    if state.startup_stage in {"building graph", "building highway cache"}:
+        return {"status": state.startup_stage}
+
+    if state.graph_loaded:
+        return {"status": "building highway cache"}
 
     return {
         "status": "no_graph",
         "graph_path": GRAPH_PATH,
-        "detail": state.graph_error or "graph.json is not available.",
+        "detail": state.graph_error or "graph cache is not available.",
     }
 
 
@@ -383,7 +504,7 @@ def summary():
         return {
             "status": "no_graph",
             "graph_path": GRAPH_PATH,
-            "detail": state.graph_error or "graph.json is not available.",
+            "detail": state.graph_error or "graph cache is not available.",
         }
 
     edge_count = sum(len(neighbours) for neighbours in state.graph.values())

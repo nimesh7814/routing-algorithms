@@ -11,9 +11,9 @@ Dijkstra so the API still returns an optimal shortest path for nonnegative
 weights.
 """
 
-import json
 import math
 import os
+import pickle
 import time
 from heapq import heappop, heappush
 
@@ -172,22 +172,32 @@ def build_highway_hierarchy(graph):
 
 def save_hh(path, hw_graph, rev_hw_graph, neighbourhood_r):
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-    with open(path, "w") as f:
-        json.dump({
-            "highway_graph": {str(k): {str(nk): nv for nk, nv in nbs.items()} for k, nbs in hw_graph.items()},
-            "rev_highway_graph": {str(k): {str(nk): nv for nk, nv in nbs.items()} for k, nbs in rev_hw_graph.items()},
-            "neighbourhood_r": {str(k): v for k, v in neighbourhood_r.items()},
+    with open(path, "wb") as f:
+        pickle.dump({
+            "highway_graph": hw_graph,
+            "rev_highway_graph": rev_hw_graph,
+            "neighbourhood_r": neighbourhood_r,
             "neighbourhood_size": NEIGHBOURHOOD_SIZE,
-        }, f)
+        }, f, protocol=pickle.HIGHEST_PROTOCOL)
 
 
 def load_hh(path):
-    with open(path) as f:
-        cached = json.load(f)
-    hw = {int(k): {int(nk): nv for nk, nv in nbs.items()} for k, nbs in cached["highway_graph"].items()}
-    rev_hw = {int(k): {int(nk): nv for nk, nv in nbs.items()} for k, nbs in cached["rev_highway_graph"].items()}
-    radii = {int(k): v for k, v in cached["neighbourhood_r"].items()}
-    return hw, rev_hw, radii
+    try:
+        with open(path, "rb") as f:
+            cached = pickle.load(f)
+    except Exception:
+        import json
+
+        with open(path, "r", encoding="utf-8") as f:
+            cached = json.load(f)
+
+    if cached["highway_graph"] and isinstance(next(iter(cached["highway_graph"].keys())), str):
+        hw = {int(k): {int(nk): nv for nk, nv in nbs.items()} for k, nbs in cached["highway_graph"].items()}
+        rev_hw = {int(k): {int(nk): nv for nk, nv in nbs.items()} for k, nbs in cached["rev_highway_graph"].items()}
+        radii = {int(k): v for k, v in cached["neighbourhood_r"].items()}
+        return hw, rev_hw, radii
+
+    return cached["highway_graph"], cached["rev_highway_graph"], cached["neighbourhood_r"]
 
 
 def _build_rev_graph(graph):

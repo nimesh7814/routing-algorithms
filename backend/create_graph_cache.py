@@ -1,45 +1,15 @@
 """
-create_graph.py
-═══════════════
-Standalone CLI script to build a road-network graph and binary caches from a GeoJSON file.
+create_graph_cache.py
+═════════════════════
+Build the routing graph JSON plus the binary graph and highway caches.
 
-Run this once before starting the Docker container, or whenever you have a new
-road network file. The output is cached in export/ and loaded directly by the
-FastAPI server on startup — skipping the build step entirely. It writes the
-graph JSON plus the binary graph/highway caches used by the API.
+This script is the cache-aware variant used by the FastAPI startup flow.
+It writes:
+- export/graph.json
+- export/graph_cache.pkl
+- export/highway_cache.pkl
 
-Usage
-─────
-  # Minimal (uses .env / defaults)
-  python create_graph.py
-
-    # Explicit paths
-    python create_graph.py --input data/lka_roads.geojson --output export/lka_roads_graph.json
-
-  # Different projection (e.g. Central Europe)
-  python create_graph.py --input data/berlin.geojson --epsg 32633
-
-  # Force rebuild even if output already exists
-  python create_graph.py --force
-
-Options
-───────
-    --input   PATH    Input GeoJSON file          [default: data/roads.geojson]
-    --output  PATH    Output graph JSON file       [default: export/graph.json]
-  --epsg    INT     Projected CRS EPSG code      [default: 32644]
-  --tol     FLOAT   Node-snapping tolerance (m)  [default: 1.0]
-  --force           Overwrite existing output
-
-EPSG quick-reference
-────────────────────
-  32644  UTM Zone 44N  — Sri Lanka / South Asia      (default)
-  32643  UTM Zone 43N  — Pakistan / NW India
-  32632  UTM Zone 32N  — Central Europe (Germany, Italy…)
-  32630  UTM Zone 30N  — UK / Ireland
-  32618  UTM Zone 18N  — Eastern USA
-  32754  UTM Zone 54S  — Eastern Australia / Japan
-
-Find your zone: https://spatialreference.org/
+If graph.json already exists, it can regenerate just the binary caches.
 """
 
 import argparse
@@ -51,13 +21,13 @@ import sys
 import time
 from collections import defaultdict
 from math import hypot
+from typing import Any, Callable
 
 from pyproj import Transformer
 from scipy.spatial import KDTree
 
 from algorithms.highway import build_highway_hierarchy, save_hh
 
-# ── Allow running from project root without installing the package ─────────────
 sys.path.insert(0, os.path.dirname(__file__))
 
 logging.basicConfig(
@@ -71,6 +41,8 @@ BANNER = """
 ╔══════════════════════════════════════╗
 ║       Pathfinder — Graph Builder     ║
 ╚══════════════════════════════════════╝"""
+
+StageCallback = Callable[[str | None], None]
 
 
 def _iter_line_segments(geojson: dict):
@@ -127,18 +99,76 @@ def _highway_cache_path(output_path: str) -> str:
     return os.path.join(os.path.dirname(output_path) or ".", "highway_cache.pkl")
 
 
-def _write_pickle(path: str, payload) -> None:
+def _write_pickle(path: str, payload: Any) -> None:
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     with open(path, "wb") as file:
         pickle.dump(payload, file, protocol=pickle.HIGHEST_PROTOCOL)
 
 
+def _load_pickle(path: str) -> Any:
+    with open(path, "rb") as file:
+        return pickle.load(file)
+
+
 def _build_rev_graph(graph: dict[int, dict[int, float]]) -> dict[int, dict[int, float]]:
-    rev = {}
+    rev: dict[int, dict[int, float]] = {}
     for u, nbrs in graph.items():
         for v, w in nbrs.items():
             rev.setdefault(v, {})[u] = w
     return rev
+
+
+def _load_graph_json(path: str) -> dict[str, Any]:
+    with open(path, "r", encoding="utf-8") as file:
+        return json.load(file)
+
+
+def _graph_from_json(data: dict[str, Any]) -> tuple[list[dict[str, Any]], dict[int, dict[int, float]]]:
+    nodes = data.get("nodes", [])
+    graph = {
+        int(node_id): {int(neighbour): float(weight) for neighbour, weight in neighbours.items()}
+        for node_id, neighbours in data.get("graph", {}).items()
+    }
+    return nodes, graph
+
+
+def _write_graph_cache_from_json(graph_json_path: str, cache_path: str, epsg: int) -> dict[str, Any]:
+    data = _load_graph_json(graph_json_path)
+    nodes, graph = _graph_from_json(data)
+
+    to_wgs84 = Transformer.from_crs(f"EPSG:{epsg}", "EPSG:4326", always_xy=True)
+
+    nodes_utm: dict[int, tuple[float, float]] = {}
+    nodes_wgs84: dict[int, tuple[float, float]] = {}
+    kdtree_points: list[tuple[float, float]] = []
+    kdtree_ids: list[int] = []
+
+    for rec in nodes:
+        node_id = int(rec["node_id"])
+        x = float(rec["x"])
+        y = float(rec["y"])
+        nodes_utm[node_id] = (x, y)
+        nodes_wgs84[node_id] = to_wgs84.transform(x, y)
+        kdtree_points.append((x, y))
+        kdtree_ids.append(node_id)
+
+    lons = [coord[0] for coord in nodes_wgs84.values()]
+    lats = [coord[1] for coord in nodes_wgs84.values()]
+
+    payload = {
+        "nodes_utm": nodes_utm,
+        "nodes_wgs84": nodes_wgs84,
+        "graph": graph,
+        "rev_graph": _build_rev_graph(graph),
+        "kdtree": KDTree(kdtree_points) if kdtree_points else None,
+        "kdtree_ids": kdtree_ids,
+        "bbox_min_lon": min(lons) if lons else 0.0,
+        "bbox_max_lon": max(lons) if lons else 0.0,
+        "bbox_min_lat": min(lats) if lats else 0.0,
+        "bbox_max_lat": max(lats) if lats else 0.0,
+    }
+    _write_pickle(cache_path, payload)
+    return payload
 
 
 def build_highway_cache(graph: dict[int, dict[int, float]], output_path: str) -> tuple[dict[int, dict[int, float]], dict[int, dict[int, float]], dict[int, float]]:
@@ -147,7 +177,31 @@ def build_highway_cache(graph: dict[int, dict[int, float]], output_path: str) ->
     return hw_graph, rev_hw_graph, radii
 
 
-def build_graph(geojson_path: str, output_path: str, epsg: int = 32644, tolerance: float = 1.0, show_progress: bool = True, stage_callback=None):
+def ensure_binary_caches(graph_json_path: str, epsg: int = 32644, stage_callback: StageCallback | None = None) -> dict[str, Any]:
+    if stage_callback is not None:
+        stage_callback("building graph")
+
+    graph_cache_path = _graph_cache_path(graph_json_path)
+    highway_cache_path = _highway_cache_path(graph_json_path)
+
+    if os.path.exists(graph_cache_path):
+        cached = _load_pickle(graph_cache_path)
+    else:
+        cached = _write_graph_cache_from_json(graph_json_path, graph_cache_path, epsg)
+
+    if stage_callback is not None:
+        stage_callback("building highway cache")
+
+    if not os.path.exists(highway_cache_path):
+        build_highway_cache(cached["graph"], highway_cache_path)
+
+    if stage_callback is not None:
+        stage_callback("ok")
+
+    return cached
+
+
+def build_graph(geojson_path: str, output_path: str, epsg: int = 32644, tolerance: float = 1.0, show_progress: bool = True, stage_callback: StageCallback | None = None):
     started_at = time.perf_counter()
     transformer = Transformer.from_crs("EPSG:4326", f"EPSG:{epsg}", always_xy=True)
 
@@ -160,14 +214,9 @@ def build_graph(geojson_path: str, output_path: str, epsg: int = 32644, toleranc
 
     node_lookup: dict[tuple[int, int], int] = {}
     node_coords: dict[int, tuple[float, float]] = {}
-    node_coords_wgs84: dict[int, tuple[float, float]] = {}
     graph: dict[int, dict[int, float]] = defaultdict(dict)
     next_node_id = 0
     edge_count = 0
-    bbox_min_lon = float("inf")
-    bbox_max_lon = float("-inf")
-    bbox_min_lat = float("inf")
-    bbox_max_lat = float("-inf")
 
     def get_node_id(lon: float, lat: float) -> int:
         nonlocal next_node_id
@@ -183,7 +232,6 @@ def build_graph(geojson_path: str, output_path: str, epsg: int = 32644, toleranc
             next_node_id += 1
             node_lookup[key] = node_id
             node_coords[node_id] = (x, y)
-            node_coords_wgs84[node_id] = (lon, lat)
         return node_id
 
     for index, (segment, properties) in enumerate(_iter_line_segments(geojson), start=1):
@@ -197,10 +245,6 @@ def build_graph(geojson_path: str, output_path: str, epsg: int = 32644, toleranc
 
         segment_nodes = []
         for lon, lat in segment:
-            bbox_min_lon = min(bbox_min_lon, float(lon))
-            bbox_max_lon = max(bbox_max_lon, float(lon))
-            bbox_min_lat = min(bbox_min_lat, float(lat))
-            bbox_max_lat = max(bbox_max_lat, float(lat))
             segment_nodes.append(get_node_id(float(lon), float(lat)))
 
         for left_node, right_node in zip(segment_nodes, segment_nodes[1:]):
@@ -230,6 +274,15 @@ def build_graph(geojson_path: str, output_path: str, epsg: int = 32644, toleranc
         sys.stdout.write("\n")
         sys.stdout.flush()
 
+    node_coords_wgs84 = {
+        node_id: Transformer.from_crs(f"EPSG:{epsg}", "EPSG:4326", always_xy=True).transform(coords[0], coords[1])
+        for node_id, coords in node_coords.items()
+    }
+    xs = [coords[0] for coords in node_coords.values()]
+    ys = [coords[1] for coords in node_coords.values()]
+    lons = [coord[0] for coord in node_coords_wgs84.values()]
+    lats = [coord[1] for coord in node_coords_wgs84.values()]
+
     nodes = [
         {"node_id": node_id, "x": coords[0], "y": coords[1]}
         for node_id, coords in sorted(node_coords.items())
@@ -249,19 +302,18 @@ def build_graph(geojson_path: str, output_path: str, epsg: int = 32644, toleranc
         "nodes_wgs84": node_coords_wgs84,
         "graph": graph_dict,
         "rev_graph": _build_rev_graph(graph_dict),
-        "kdtree": KDTree([(coords[0], coords[1]) for _, coords in sorted(node_coords.items())]),
+        "kdtree": KDTree(list(zip(xs, ys))) if xs else None,
         "kdtree_ids": [node_id for node_id, _coords in sorted(node_coords.items())],
-        "bbox_min_lon": bbox_min_lon if bbox_min_lon != float("inf") else 0.0,
-        "bbox_max_lon": bbox_max_lon if bbox_max_lon != float("-inf") else 0.0,
-        "bbox_min_lat": bbox_min_lat if bbox_min_lat != float("inf") else 0.0,
-        "bbox_max_lat": bbox_max_lat if bbox_max_lat != float("-inf") else 0.0,
+        "bbox_min_lon": min(lons) if lons else 0.0,
+        "bbox_max_lon": max(lons) if lons else 0.0,
+        "bbox_min_lat": min(lats) if lats else 0.0,
+        "bbox_max_lat": max(lats) if lats else 0.0,
     }
     _write_pickle(_graph_cache_path(output_path), graph_cache_payload)
 
     if stage_callback is not None:
         stage_callback("building highway cache")
     build_highway_cache(graph_dict, _highway_cache_path(output_path))
-
     if stage_callback is not None:
         stage_callback("ok")
 
@@ -281,28 +333,58 @@ def build_graph(geojson_path: str, output_path: str, epsg: int = 32644, toleranc
 
 def parse_args():
     p = argparse.ArgumentParser(
-        description="Build a routing graph JSON from a GeoJSON road network.",
+        description="Build a routing graph cache from a GeoJSON road network.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    p.add_argument("--input",  default=None, help="Input GeoJSON path")
+    p.add_argument("--input", default=None, help="Input GeoJSON path")
     p.add_argument("--output", default=None, help="Output graph JSON path")
-    p.add_argument("--epsg",   type=int, default=None, help="Projected CRS EPSG code")
-    p.add_argument("--tol",    type=float, default=1.0, help="Node-snapping tolerance in metres")
-    p.add_argument("--force",  action="store_true", help="Rebuild even if output exists")
+    p.add_argument("--epsg", type=int, default=None, help="Projected CRS EPSG code")
+    p.add_argument("--tol", type=float, default=1.0, help="Node-snapping tolerance in metres")
+    p.add_argument("--force", action="store_true", help="Rebuild even if output exists")
     return p.parse_args()
 
 
 def resolve_paths(args):
-    """
-    Priority order for each setting:
-      1. CLI argument
-      2. Environment variable (same as docker-compose uses)
-      3. Sensible default
-    """
-    input_file  = args.input  or os.environ.get("GEOJSON_FILE", "data/roads.geojson")
-    output_file = args.output or os.environ.get("GRAPH_FILE",   "export/graph.json")
-    epsg        = args.epsg   or int(os.environ.get("EPSG", "32644"))
+    input_file = args.input or os.environ.get("GEOJSON_FILE", "data/lka_roads.geojson")
+    output_file = args.output or os.environ.get("GRAPH_FILE", "export/graph.json")
+    epsg = args.epsg or int(os.environ.get("EPSG", "32644"))
     return input_file, output_file, epsg
+
+
+def _print_summary(output_file: str):
+    try:
+        if output_file.lower().endswith(".json"):
+            with open(output_file, "r", encoding="utf-8") as file:
+                data = json.load(file)
+            n_nodes = len(data.get("graph", {}))
+            n_edges = sum(len(v) for v in data.get("graph", {}).values())
+        else:
+            with open(output_file, "rb") as file:
+                data = pickle.load(file)
+            n_nodes = len(data.get("graph", {}))
+            n_edges = sum(len(v) for v in data.get("graph", {}).values())
+        print()
+        print(f"   Existing graph: {n_nodes:,} nodes, {n_edges:,} edges")
+        print(f"   File          : {output_file}")
+        print()
+    except Exception:
+        pass
+
+
+def _ensure_binary_caches(output_file: str, epsg: int) -> None:
+    graph_cache_path = _graph_cache_path(output_file)
+    highway_cache_path = _highway_cache_path(output_file)
+
+    if not os.path.exists(output_file):
+        return
+
+    if not os.path.exists(graph_cache_path):
+        cached = _write_graph_cache_from_json(output_file, graph_cache_path, epsg)
+    else:
+        cached = _load_pickle(graph_cache_path)
+
+    if not os.path.exists(highway_cache_path):
+        build_highway_cache(cached["graph"], highway_cache_path)
 
 
 def main():
@@ -315,20 +397,21 @@ def main():
     logger.info(f"EPSG     : {epsg}")
     logger.info(f"Tolerance: {args.tol} m")
 
-    # ── Validate input ────────────────────────────────────────────────────────
     if not os.path.exists(input_file):
         logger.error(f"Input file not found: {input_file}")
         logger.error("Place your GeoJSON in the data/ folder, or pass --input <path>")
         sys.exit(1)
 
-    # ── Skip if output already exists (unless --force) ────────────────────────
     if os.path.exists(output_file) and not args.force:
         size_mb = os.path.getsize(output_file) / 1_048_576
         logger.info(
-            f"Output already exists ({size_mb:.1f} MB) — skipping build.\n"
-            f"  Use --force to rebuild."
+            f"Output already exists ({size_mb:.1f} MB) — skipping graph rebuild.\n"
+            f"  Ensuring binary caches are present. Use --force to rebuild the graph."
         )
+        _ensure_binary_caches(output_file, epsg)
         _print_summary(output_file)
+        print(f"   Graph cache   : {_graph_cache_path(output_file)}")
+        print(f"   Highway cache : {_highway_cache_path(output_file)}")
         return
 
     logger.info("Building graph…")
@@ -346,33 +429,14 @@ def main():
     print(f"   Edges    : {result['n_edges']:,}")
     print(f"   Time     : {result['elapsed_s']:.1f}s")
     print(f"   Saved to : {result['output_path']}")
+    print(f"   Graph cache   : {result['graph_cache_path']}")
+    print(f"   Highway cache : {result['highway_cache_path']}")
     print()
     print("Next steps:")
-    print("  1. Run  docker compose up  (the server will load this file directly)")
+    print("  1. Run  docker compose up  (the server will load these files directly)")
     print("  2. Or pre-build the Highway Hierarchy index:")
-    print(f"       python create_graph.py --input {input_file} --output {output_file}")
-    print(f"     Then start the container — the binary caches are also generated.")
-
-
-def _print_summary(output_file):
-    """Quick peek at an existing graph file."""
-    try:
-        if output_file.lower().endswith(".json"):
-            with open(output_file) as f:
-                data = json.load(f)
-            n_nodes = len(data.get("graph", {}))
-            n_edges = sum(len(v) for v in data.get("graph", {}).values())
-        else:
-            with open(output_file, "rb") as f:
-                data = pickle.load(f)
-            n_nodes = len(data.get("graph", {}))
-            n_edges = sum(len(v) for v in data.get("graph", {}).values())
-        print()
-        print(f"   Existing graph: {n_nodes:,} nodes, {n_edges:,} edges")
-        print(f"   File          : {output_file}")
-        print()
-    except Exception:
-        pass
+    print(f"       python create_graph_cache.py --input {input_file} --output {output_file}")
+    print("     Then start the container — the binary caches are also generated.")
 
 
 if __name__ == "__main__":

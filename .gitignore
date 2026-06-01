@@ -6,3 +6,4 @@ backend/export/*
 backend/export/highway_cache.json
 backend/**/__pycache__/
 backend/**/*.pyc
+backend\__pycache__
